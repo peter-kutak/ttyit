@@ -11,7 +11,10 @@
 #include <linux/miscdevice.h>       // misc_register
 //#include <linux/serial_core.h>
 //#include <linux/serial.h>
-#include <linux/sysfs.h>
+//#include <linux/sysfs.h>
+#include <linux/console.h>
+#include <linux/tty.h>
+
 
 #define DEBUG 1                  // if uncommented, will write some debug messages to /var/log/kern.log
 
@@ -21,6 +24,7 @@ static unsigned int MajorNumber;
 static wait_queue_head_t WaitQueue;
 static unsigned int DeviceOpen;
 static struct i2c_client *_client;
+
 
 // ring buffer used for receiving data
 enum { RX_BUFF_SIZE = 128 };
@@ -34,36 +38,76 @@ static volatile unsigned int TxTail = TX_BUFF_SIZE;
 static volatile unsigned int TxHead = TX_BUFF_SIZE;
 static unsigned char TxBuff[TX_BUFF_SIZE];
 
-static int ttyit_open(struct inode* inode, struct file* file);
-static int ttyit_close(struct inode *inode, struct file *file);
-static unsigned int ttyit_poll(struct file* file_ptr, poll_table* wait);
-static ssize_t ttyit_read(struct file* file_ptr, char __user* user_buffer, size_t Count, loff_t* offset);
-static ssize_t ttyit_write(struct file* file_ptr, const char __user* user_buffer, size_t Count, loff_t* offset);
-static long ttyit_ioctl(struct file *fp, unsigned int cmd, unsigned long arg);
+//ako misc device ------------------------------------------------------------------------------
+//static int ttyit_open(struct inode* inode, struct file* file);
+//static int ttyit_close(struct inode *inode, struct file *file);
+//static unsigned int ttyit_poll(struct file* file_ptr, poll_table* wait);
+//static ssize_t ttyit_read(struct file* file_ptr, char __user* user_buffer, size_t Count, loff_t* offset);
+//static ssize_t ttyit_write(struct file* file_ptr, const char __user* user_buffer, size_t Count, loff_t* offset);
+//static long ttyit_ioctl(struct file *fp, unsigned int cmd, unsigned long arg);
+//
+//// file operations with this kernel module
+//static struct file_operations ttyit_fops = {
+//    .owner          = THIS_MODULE,
+//    .open           = ttyit_open,
+//    .release        = ttyit_close,
+//    .poll           = ttyit_poll,
+//    .read           = ttyit_read,
+//    .write          = ttyit_write,
+//    .unlocked_ioctl = ttyit_ioctl
+//};
+//
+//static struct miscdevice misc = {
+//    .minor = MISC_DYNAMIC_MINOR,
+//    .name = DEVICE_NAME,
+//    .fops = &ttyit_fops,
+//    .mode = S_IRUSR |   // User read
+//            S_IWUSR |   // User write
+//            S_IRGRP |   // Group read
+//            S_IWGRP |   // Group write
+//            S_IROTH |   // Other read
+//            S_IWOTH     // Other write
+//};
+// ako tty console ------------------------------------------------------------------
+static const struct tty_port_operations ttyit_port_ops;
+static struct tty_driver *ttyit_driver;
+static struct tty_port ttyit_port;
 
-// file operations with this kernel module
-static struct file_operations ttyit_fops = {
-    .owner          = THIS_MODULE,
-    .open           = ttyit_open,
-    .release        = ttyit_close,
-    .poll           = ttyit_poll,
-    .read           = ttyit_read,
-    .write          = ttyit_write,
-    .unlocked_ioctl = ttyit_ioctl
+static int ttyit_open(struct tty_struct *tty, struct file *filp);
+static void ttyit_close(struct tty_struct *tty, struct file *filp);
+static void ttyit_hangup(struct tty_struct *tty);
+static int ttyit_write(struct tty_struct *tty, const unsigned char *buf, int count);
+static unsigned int ttyit_write_room(struct tty_struct *tty);
+static const struct tty_operations ttyit_ops = {
+	.open = ttyit_open,
+	.close = ttyit_close,
+	.hangup = ttyit_hangup,
+	.write = ttyit_write,
+	.write_room = ttyit_write_room,
 };
 
-static struct miscdevice misc = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name = DEVICE_NAME,
-    .fops = &ttyit_fops,
-    .mode = S_IRUSR |   // User read
-            S_IWUSR |   // User write
-            S_IRGRP |   // Group read
-            S_IWGRP |   // Group write
-            S_IROTH |   // Other read
-            S_IWOTH     // Other write
+static struct tty_driver *ttyit_device(struct console *c, int *index);
+static struct console ttyit_console = {
+	.name   = "ttyit",
+	.device = ttyit_device,
+	.index  = -1,
 };
+//static struct console ttyit_console = {
+//	.name		= TTYIT_DEVICENAME,
+//	.write		= ttyit_console_write,
+//	.device		= uart_console_device,
+//	.setup		= ttyit_console_setup,
+//	.flags		= CON_PRINTBUFFER,
+//	.index		= -1,
+//	.data		= &ttyit_uart,
+//};
 
+#define TTYIT_CONSOLE_DEVICE	(&ttyit_console)
+
+
+
+
+//-----------------------------------------------------------------------------------
 #define MAX_MSG_SIZE 16
 static int unpack(const u8 *in, const int size, u8 *out) {
   if(size < 2) { return 0; }
@@ -265,74 +309,74 @@ static ssize_t ttyit_read(struct file* file_ptr, char __user* user_buffer, size_
 //      "echo "hello" > /dev/ttyit"
 //
 // ===============================================================================================
-static ssize_t ttyit_write(struct file* file_ptr, const char __user* user_buffer, size_t Count, loff_t* offset) {
-//    int result;
-//    int Timeout;
-    //unsigned long Flags;
-//    unsigned int DataWord;
-    //unsigned int IntMask;
-
-#ifdef DEBUG
-    printk(KERN_NOTICE "ttyit: Write request with offset=%d and count=%u\n", (int)*offset, (unsigned int)Count);
-#endif
-
-  struct i2c_client *client = NULL;
-  client = _client;
-//  struct i2c_client *client = i2c_verify_client(&misc);
-//  struct i2c_client *client = i2c_new_client_device(struct i2c_adapter *adap, struct i2c_board_info const *info);
-  pr_info("i2c client = %x\n", client);
-  if(client && Count > 0) {
-//    int reg = 0;
-//    int value = 0x41;
-//    Count = i2c_smbus_write_byte_data(_client, reg, value);
-//    const __u8 values[16] = {0x41,0x42,0x41,0x41,0x41,0x41,0x41,0x41,0x41,0x41,0x41,0x43,0x0a,0x0d,0};
-    //__s32 ret = i2c_smbus_write_quick(file, value);
-    //__s32 ret = i2c_smbus_write_byte(file, value);
-    //__s32 ret = i2c_smbus_write_block_data(client, 0, 16, values);
-    if(Count > MAX_MSG_SIZE) {
-      //FIXME odoslat po castiach - aspon myslim ze je tam limit 32 idealne neist na hranu
-      pr_warn("writen chunk %d longer than i2c message limit\n", Count);
-    }
-    u8 packet[MAX_MSG_SIZE+2];
-    pack(user_buffer, Count, packet);
-    __s32 ret = i2c_smbus_write_block_data(client, 0, Count+2, (u8*)&packet);
-    if(ret<0) {
-#ifdef DEBUG
-      pr_err("i2c write block failed\n");
-#endif
-      return -EFAULT;
-    }
-  }
-
-//    // if transmission is still in progress, wait until done
-//    // =====================================================
-//    Timeout = 500;
-//    while (TxTail < TxHead) {
-//        if (--Timeout < 0)
-//            return -EBUSY;
-//        udelay(500);
+//static ssize_t ttyit_write(struct file* file_ptr, const char __user* user_buffer, size_t Count, loff_t* offset) {
+////    int result;
+////    int Timeout;
+//    //unsigned long Flags;
+////    unsigned int DataWord;
+//    //unsigned int IntMask;
+//
+//#ifdef DEBUG
+//    printk(KERN_NOTICE "ttyit: Write request with offset=%d and count=%u\n", (int)*offset, (unsigned int)Count);
+//#endif
+//
+//  struct i2c_client *client = NULL;
+//  client = _client;
+////  struct i2c_client *client = i2c_verify_client(&misc);
+////  struct i2c_client *client = i2c_new_client_device(struct i2c_adapter *adap, struct i2c_board_info const *info);
+//  pr_info("i2c client = %x\n", client);
+//  if(client && Count > 0) {
+////    int reg = 0;
+////    int value = 0x41;
+////    Count = i2c_smbus_write_byte_data(_client, reg, value);
+////    const __u8 values[16] = {0x41,0x42,0x41,0x41,0x41,0x41,0x41,0x41,0x41,0x41,0x41,0x43,0x0a,0x0d,0};
+//    //__s32 ret = i2c_smbus_write_quick(file, value);
+//    //__s32 ret = i2c_smbus_write_byte(file, value);
+//    //__s32 ret = i2c_smbus_write_block_data(client, 0, 16, values);
+//    if(Count > MAX_MSG_SIZE) {
+//      //FIXME odoslat po castiach - aspon myslim ze je tam limit 32 idealne neist na hranu
+//      pr_warn("writen chunk %d longer than i2c message limit\n", Count);
 //    }
+//    u8 packet[MAX_MSG_SIZE+2];
+//    pack(user_buffer, Count, packet);
+//    __s32 ret = i2c_smbus_write_block_data(client, 0, Count+2, (u8*)&packet);
+//    if(ret<0) {
+//#ifdef DEBUG
+//      pr_err("i2c write block failed\n");
+//#endif
+//      return -EFAULT;
+//    }
+//  }
 //
-//    // copying data from user space requires a special function to be called
-//    // =====================================================================
-//    if (Count > TX_BUFF_SIZE)
-//        Count = TX_BUFF_SIZE;
-//    result = copy_from_user(TxBuff, user_buffer, Count);
-//    if (result > 0)             // not all requested bytes copied
-//        Count = result;         // nuber of bytes copied
-//    else if (result != 0)
-//        return -EFAULT;
+////    // if transmission is still in progress, wait until done
+////    // =====================================================
+////    Timeout = 500;
+////    while (TxTail < TxHead) {
+////        if (--Timeout < 0)
+////            return -EBUSY;
+////        udelay(500);
+////    }
+////
+////    // copying data from user space requires a special function to be called
+////    // =====================================================================
+////    if (Count > TX_BUFF_SIZE)
+////        Count = TX_BUFF_SIZE;
+////    result = copy_from_user(TxBuff, user_buffer, Count);
+////    if (result > 0)             // not all requested bytes copied
+////        Count = result;         // nuber of bytes copied
+////    else if (result != 0)
+////        return -EFAULT;
+////
+////    DataWord = TxBuff[0];
+////    TxTail = 1;
+////    TxHead = Count;
 //
-//    DataWord = TxBuff[0];
-//    TxTail = 1;
-//    TxHead = Count;
-
-#ifdef DEBUG
-  pr_info("Write finish with %lu bytes written\n", Count);
-#endif
-
-  return Count;        // the number of bytes actually transmitted
-}
+//#ifdef DEBUG
+//  pr_info("Write finish with %lu bytes written\n", Count);
+//#endif
+//
+//  return Count;        // the number of bytes actually transmitted
+//}
     
     
 
@@ -350,30 +394,30 @@ static ssize_t ttyit_write(struct file* file_ptr, const char __user* user_buffer
 //      Called when a process tries to open the device file, like "cat /dev/ttyit"
 //
 // ===============================================================================================
-static int ttyit_open(struct inode* inode, struct file* file) {
-
-#ifdef DEBUG
-  pr_info("Open at at major %d  minor %d", imajor(inode), iminor(inode));
-#endif
-
-  // do not allow another open if already open
-  // =========================================
-  if (DeviceOpen) {
-    return -EBUSY;
-  }
-  DeviceOpen++;
-
-  // reset the ring buffer and the linear buffer
-  // ===========================================
-  RxTail = RxHead = 0;
-  TxTail = TxHead = TX_BUFF_SIZE;
-
-#ifdef DEBUG
-  pr_info("Open finish\n");
-#endif
-
-  return 0;
-}
+//static int ttyit_open(struct inode* inode, struct file* file) {
+//
+//#ifdef DEBUG
+//  pr_info("Open at at major %d  minor %d", imajor(inode), iminor(inode));
+//#endif
+//
+//  // do not allow another open if already open
+//  // =========================================
+//  if (DeviceOpen) {
+//    return -EBUSY;
+//  }
+//  DeviceOpen++;
+//
+//  // reset the ring buffer and the linear buffer
+//  // ===========================================
+//  RxTail = RxHead = 0;
+//  TxTail = TxHead = TX_BUFF_SIZE;
+//
+//#ifdef DEBUG
+//  pr_info("Open finish\n");
+//#endif
+//
+//  return 0;
+//}
 
 
 // ===============================================================================================
@@ -390,15 +434,15 @@ static int ttyit_open(struct inode* inode, struct file* file) {
 //      Called when a process closes the device file.
 //
 // ===============================================================================================
-static int ttyit_close(struct inode *inode, struct file *file) {
-  pr_info("Close at at major %d  minor %d\n", imajor(inode), iminor(inode));
-
-  DeviceOpen--;
-
-  pr_info("Close finish\n");
-
-  return 0;
-}
+//static int ttyit_close(struct inode *inode, struct file *file) {
+//  pr_info("Close at at major %d  minor %d\n", imajor(inode), iminor(inode));
+//
+//  DeviceOpen--;
+//
+//  pr_info("Close finish\n");
+//
+//  return 0;
+//}
 
 
 // ===============================================================================================
@@ -420,56 +464,6 @@ static int ttyit_close(struct inode *inode, struct file *file) {
 static long ttyit_ioctl(struct file *fp, unsigned int cmd, unsigned long arg) {
 	return 0;
 }
-
-//static int __init ttyit_console_setup(struct console *co, char *options) {
-//	int ret;
-//	struct uart_port *port = &atmel_ports[co->index].uart;
-//	int baud = 115200;
-//	int bits = 8;
-//	int parity = 'n';
-//	int flow = 'n';
-//
-//	if (port->membase == NULL) {
-//		/* Port not initialized yet - delay setup */
-//		return -ENODEV;
-//	}
-//
-//	ret = clk_prepare_enable(atmel_ports[co->index].clk);
-//	if (ret)
-//		return ret;
-//
-//	atmel_uart_writel(port, ATMEL_US_IDR, -1);
-//	atmel_uart_writel(port, ATMEL_US_CR, ATMEL_US_RSTSTA | ATMEL_US_RSTRX);
-//	atmel_uart_writel(port, ATMEL_US_CR, ATMEL_US_TXEN | ATMEL_US_RXEN);
-//
-//	if (options)
-//		uart_parse_options(options, &baud, &parity, &bits, &flow);
-//	else
-//		atmel_console_get_options(port, &baud, &parity, &bits);
-//
-//	return uart_set_options(port, co, baud, parity, bits, flow);
-//}
-
-//static struct console ttyit_console = {
-//	.name		= TTYIT_DEVICENAME,
-//	.write		= ttyit_console_write,
-//	.device		= uart_console_device,
-//	.setup		= ttyit_console_setup,
-//	.flags		= CON_PRINTBUFFER,
-//	.index		= -1,
-//	.data		= &ttyit_uart,
-//};
-
-//#define TTYIT_CONSOLE_DEVICE	(&ttyit_console)
-
-//static struct uart_driver ttyit_uart = {                                                                                             
-// .owner    = THIS_MODULE,        
-// .dev_name = DEVICE_NAME,            
-// .major    = 0,
-// .minor    = 0,
-// .nr       = TTYIT_MAX_DEVS,     
-// .cons     = TTYIT_CONSOLE_DEVICE,
-//};  
 
 /* Addresses to scan */
 static const unsigned short normal_i2c[] = {
@@ -554,7 +548,7 @@ static struct i2c_driver ttyit_i2c_uart_driver = {
 
 // ===============================================================================================
 //
-//                                    ttyit_register
+//                                    ttyit_init
 //
 // ===============================================================================================
 //
@@ -569,44 +563,71 @@ static struct i2c_driver ttyit_i2c_uart_driver = {
 //      device name is given and the file_operations structure is also passed to the kernel.
 //
 // ===============================================================================================
-static int __init ttyit_register(void) {
+static int __init ttyit_init(void) {
+#ifdef DEBUG
+  pr_info("init() is called\n");
+#endif
+
+	struct tty_driver *driver;
+	int ret;
+
+	driver = tty_alloc_driver(1,
+		TTY_DRIVER_RESET_TERMIOS |
+		TTY_DRIVER_REAL_RAW |
+		TTY_DRIVER_UNNUMBERED_NODE);
+	if (IS_ERR(driver))
+		return PTR_ERR(driver);
+
+	tty_port_init(&ttyit_port);
+	ttyit_port.ops = &ttyit_port_ops;
+
+	driver->driver_name = "ttyit";
+	driver->name = "ttyit";
+	driver->type = TTY_DRIVER_TYPE_CONSOLE;
+	driver->init_termios = tty_std_termios;
+	driver->init_termios.c_oflag = OPOST | OCRNL | ONOCR | ONLRET;
+	tty_set_operations(driver, &ttyit_ops);
+	tty_port_link_device(&ttyit_port, driver, 0);
+
+	ret = tty_register_driver(driver);
+	if (ret < 0) {
+		tty_driver_kref_put(driver);
+		tty_port_destroy(&ttyit_port);
+		return ret;
+	}
+
+	ttyit_driver = driver;
+	register_console(&ttyit_console);
+
+//	return 0;
+
   int result;
-
-#ifdef DEBUG
-  printk(KERN_NOTICE "ttyit: register_device() is called\n");
-#endif
-
-  // Dynamically allocate a major number for the device
-  // ==================================================
-  MajorNumber = register_chrdev(0, DEVICE_NAME, &ttyit_fops);
-  if (MajorNumber < 0) {
-    printk(KERN_WARNING "ttyit: can\'t register character device with errorcode = %i\n", MajorNumber);
-    return MajorNumber;
-  }
-
-#ifdef DEBUG
-  printk(KERN_NOTICE "ttyit: registered character device with major number = %i and minor numbers 0...255\n", MajorNumber);
-#endif
-
-  // Register the device driver. We are using misc_register instead of
-  // device_create so we are able to set the attributes to rw for everybody
-  // ======================================================================
-  result = misc_register(&misc);
-  if (result) {
-    unregister_chrdev(MajorNumber, DEVICE_NAME);
-    printk(KERN_ALERT "ttyit: Failed to create the device\n");
-    return result;
-  }
-
-  // set up a queue for waiting
-  // ==========================
-//  init_waitqueue_head(&WaitQueue);
-
-//  result = uart_register_driver(&ttyit_uart);
-//  if (result) {                                                                                                                             
-//    pr_err("Registering UART driver failed\n");
+//
+//  // Dynamically allocate a major number for the device
+//  // ==================================================
+//  MajorNumber = register_chrdev(0, DEVICE_NAME, &ttyit_fops);
+//  if (MajorNumber < 0) {
+//    printk(KERN_WARNING "ttyit: can\'t register character device with errorcode = %i\n", MajorNumber);
+//    return MajorNumber;
+//  }
+//
+//#ifdef DEBUG
+//  printk(KERN_NOTICE "ttyit: registered character device with major number = %i and minor numbers 0...255\n", MajorNumber);
+//#endif
+//
+//  // Register the device driver. We are using misc_register instead of
+//  // device_create so we are able to set the attributes to rw for everybody
+//  // ======================================================================
+//  result = misc_register(&misc);
+//  if (result) {
+//    unregister_chrdev(MajorNumber, DEVICE_NAME);
+//    printk(KERN_ALERT "ttyit: Failed to create the device\n");
 //    return result;
 //  }
+//	
+//  // set up a queue for waiting
+//  // ==========================
+////  init_waitqueue_head(&WaitQueue);
 
 #ifdef DEBUG
   pr_info("i2c add driver\n");
@@ -619,9 +640,9 @@ static int __init ttyit_register(void) {
     //FIXME unregister uart driver
     return result;
   }
-  printk(KERN_INFO "ttyit: i2c add driver result %d\n", result);
+  pr_info("i2c add driver result %d\n", result);
 
-  DeviceOpen = 0;
+//  DeviceOpen = 0;
 
 #ifdef DEBUG
   pr_info("device created correctly\n");
@@ -633,7 +654,7 @@ static int __init ttyit_register(void) {
     
 // ===============================================================================================
 //
-//                                    ttyit_unregister
+//                                    ttyit_exit
 //
 // ===============================================================================================
 // Parameter:
@@ -644,15 +665,19 @@ static int __init ttyit_register(void) {
 //      Unmap the I/O, free the IRQ and unregister the device
 //
 // ===============================================================================================
-void ttyit_unregister(void) {
+static void __exit ttyit_exit(void) {
   pr_info("unregister_device()\n");
 
-  misc_deregister(&misc);
-  unregister_chrdev(MajorNumber, DEVICE_NAME);
+//  misc_deregister(&misc);
+//  unregister_chrdev(MajorNumber, DEVICE_NAME);
+//  MajorNumber = 0;
 
   i2c_del_driver(&ttyit_i2c_uart_driver);
-//  uart_unregister_driver(&ttyit_uart);
-  MajorNumber = 0;
+
+  unregister_console(&ttyit_console);
+	tty_unregister_driver(ttyit_driver);
+	tty_driver_kref_put(ttyit_driver);
+	tty_port_destroy(&ttyit_port);
 }
 
 // ===============================================================================================
@@ -660,8 +685,8 @@ void ttyit_unregister(void) {
 //                                module_init()      module_exit()
 //
 // ===============================================================================================
-module_init(ttyit_register);
-module_exit(ttyit_unregister);
+module_init(ttyit_init);
+module_exit(ttyit_exit);
 
 
 
@@ -669,4 +694,55 @@ MODULE_AUTHOR("Peter Kutak");
 MODULE_DESCRIPTION("i2c terminal driver");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("1.0");
+
+static int ttyit_open(struct tty_struct *tty, struct file *filp)
+{
+	return tty_port_open(&ttyit_port, tty, filp);
+}
+static void ttyit_close(struct tty_struct *tty, struct file *filp)
+{
+	tty_port_close(&ttyit_port, tty, filp);
+}
+static void ttyit_hangup(struct tty_struct *tty)
+{
+	tty_port_hangup(&ttyit_port);
+}
+static int ttyit_write(struct tty_struct *tty, const unsigned char *buf,
+			 int count)
+{
+  struct i2c_client *client = NULL;
+  client = _client;
+  pr_info("i2c client = %x\n", client);
+  if(client && count > 0) {
+    if(count > MAX_MSG_SIZE) {
+      //FIXME odoslat po castiach - aspon myslim ze je tam limit 32 idealne neist na hranu
+      pr_warn("writen chunk %d longer than i2c message limit\n", count);
+    }
+    u8 packet[MAX_MSG_SIZE+2];
+    pack(buf, count, packet);
+    s32 ret = i2c_smbus_write_block_data(client, 0, count+2, (u8*)&packet);
+    if(ret<0) {
+#ifdef DEBUG
+      pr_err("i2c write block failed\n");
+#endif
+      return -EFAULT;
+    }
+  }
+
+#ifdef DEBUG
+  pr_info("Write finish with %lu bytes written\n", count);
+#endif
+
+  return count;        // the number of bytes actually transmitted
+}
+static unsigned int ttyit_write_room(struct tty_struct *tty)
+{
+  //TODO kolko miesta mam v buffri
+	return MAX_MSG_SIZE;
+}
+static struct tty_driver *ttyit_device(struct console *c, int *index)
+{
+	*index = 0;
+	return ttyit_driver;
+}
 
