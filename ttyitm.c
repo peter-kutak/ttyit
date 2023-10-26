@@ -1,3 +1,5 @@
+//https://docs.kernel.org/6.1/driver-api/tty/index.html#writing-tty-driver
+//
 #include <linux/kernel.h>           // printk()
 #include <linux/errno.h>            // error codes
 #include <linux/module.h>           // THIS_MODULE
@@ -19,11 +21,14 @@
 #define DEBUG 1                  // if uncommented, will write some debug messages to /var/log/kern.log
 
 #define DEVICE_NAME         "ttyit"           // The device will appear at /dev/ttyit
-#define TTYIT_MAX_DEVS    8
+//#define TTYIT_MAX_DEVS    8
+#define TICK_PER_SEC 1
+
 static unsigned int MajorNumber;
 static wait_queue_head_t WaitQueue;
 static unsigned int DeviceOpen;
 static struct i2c_client *_client;
+static DEFINE_SPINLOCK(SpinLock);
 
 
 // ring buffer used for receiving data
@@ -68,7 +73,7 @@ static unsigned char TxBuff[TX_BUFF_SIZE];
 //            S_IROTH |   // Other read
 //            S_IWOTH     // Other write
 //};
-// ako tty console ------------------------------------------------------------------
+// ako tty  ------------------------------------------------------------------
 static const struct tty_port_operations ttyit_port_ops;
 static struct tty_driver *ttyit_driver;
 static struct tty_port ttyit_port;
@@ -78,14 +83,30 @@ static void ttyit_close(struct tty_struct *tty, struct file *filp);
 static void ttyit_hangup(struct tty_struct *tty);
 static int ttyit_write(struct tty_struct *tty, const unsigned char *buf, int count);
 static unsigned int ttyit_write_room(struct tty_struct *tty);
+/** toto je len niaky debug interface
+static int ttyit_poll_init(struct tty_driver *driver, int line, char *options);
+static int ttyit_poll_get_char(struct tty_driver *driver, int line);
+static void ttyit_poll_put_char(struct tty_driver *driver, int line, char ch);
+*/
+static int ttyit_proc_show(struct seq_file *m, void *driver);
+static void ttyit_poll(struct timer_list *unused);
 static const struct tty_operations ttyit_ops = {
 	.open = ttyit_open,
 	.close = ttyit_close,
 	.hangup = ttyit_hangup,
 	.write = ttyit_write,
 	.write_room = ttyit_write_room,
+#ifdef CONFIG_CONSOLE_POLL //toto ma ist z konfigu takze netusim ako to funguje
+  .poll_init = ttyit_poll_init,
+  .poll_get_char = ttyit_poll_get_char,
+  .poll_put_char = ttyit_poll_put_char,
+#endif
+  .proc_show = ttyit_proc_show,
 };
+//timer na citanie z i2c mozno by som tam mal aj citat aby som nemal kolizie
+static DEFINE_TIMER(ttyitTimer, ttyit_poll);
 
+//console vrstva -------------------------------------------------------------
 static struct tty_driver *ttyit_device(struct console *c, int *index);
 static struct console ttyit_console = {
 	.name   = "ttyit",
@@ -103,7 +124,6 @@ static struct console ttyit_console = {
 //};
 
 #define TTYIT_CONSOLE_DEVICE	(&ttyit_console)
-
 
 
 
@@ -153,6 +173,7 @@ static void pack(const u8 *in, const int size, u8 *out) {
 //      Probe the receiver if some data available. Return after timeout anyway.
 //
 // ===============================================================================================
+/*
 static unsigned int ttyit_poll(struct file* file_ptr, poll_table* wait) {
   unsigned int RxNext;
 #ifdef DEBUG
@@ -225,6 +246,7 @@ static unsigned int ttyit_poll(struct file* file_ptr, poll_table* wait) {
 //    return 0;
 //  }
 }
+*/
 
 // ===============================================================================================
 //
@@ -589,7 +611,10 @@ static int __init ttyit_init(void) {
 	tty_set_operations(driver, &ttyit_ops);
 	tty_port_link_device(&ttyit_port, driver, 0);
 
-	ret = tty_register_driver(driver);
+  //tu vznika sysfs
+  pr_info("driver major %d",driver->major);
+  pr_info("driver flags %d",driver->flags);
+  ret = tty_register_driver(driver);
 	if (ret < 0) {
 		tty_driver_kref_put(driver);
 		tty_port_destroy(&ttyit_port);
@@ -598,8 +623,14 @@ static int __init ttyit_init(void) {
 
 	ttyit_driver = driver;
 	register_console(&ttyit_console);
-
 //	return 0;
+
+//podla tty-io.c by to mohlo fungovat tak ze nad tty alebo nad console zavediem fileops
+//  cdev_init(&tty_cdev, &tty_fops);
+//	if (cdev_add(&tty_cdev, MKDEV(TTYAUX_MAJOR, 0), 1) ||
+//	    register_chrdev_region(MKDEV(TTYAUX_MAJOR, 0), 1, "/dev/tty") < 0)
+//		panic("Couldn't register /dev/tty driver\n");
+//	device_create(tty_class, NULL, MKDEV(TTYAUX_MAJOR, 0), NULL, "tty");
 
   int result;
 //
@@ -644,6 +675,13 @@ static int __init ttyit_init(void) {
 
 //  DeviceOpen = 0;
 
+  //spustim timer na komunikaciu cez i2c
+  if (!timer_pending(&ttyitTimer)) {
+    pr_info("init timer %d -> %d\n", get_jiffies_64(), get_jiffies_64() + HZ / TICK_PER_SEC);
+	  mod_timer(&ttyitTimer, get_jiffies_64() + HZ / TICK_PER_SEC);
+  }
+	
+
 #ifdef DEBUG
   pr_info("device created correctly\n");
 #endif
@@ -668,13 +706,15 @@ static int __init ttyit_init(void) {
 static void __exit ttyit_exit(void) {
   pr_info("unregister_device()\n");
 
+	del_timer_sync(&ttyitTimer);
+  unregister_console(&ttyit_console);
+
 //  misc_deregister(&misc);
 //  unregister_chrdev(MajorNumber, DEVICE_NAME);
 //  MajorNumber = 0;
 
   i2c_del_driver(&ttyit_i2c_uart_driver);
 
-  unregister_console(&ttyit_console);
 	tty_unregister_driver(ttyit_driver);
 	tty_driver_kref_put(ttyit_driver);
 	tty_port_destroy(&ttyit_port);
@@ -697,6 +737,8 @@ MODULE_VERSION("1.0");
 
 static int ttyit_open(struct tty_struct *tty, struct file *filp)
 {
+  //TODO tty obsahuje dev, ldisc, port
+  //naco je ten file netusim
 	return tty_port_open(&ttyit_port, tty, filp);
 }
 static void ttyit_close(struct tty_struct *tty, struct file *filp)
@@ -744,5 +786,70 @@ static struct tty_driver *ttyit_device(struct console *c, int *index)
 {
 	*index = 0;
 	return ttyit_driver;
+}
+
+static int ttyit_proc_show(struct seq_file *m, void *driver) {
+	seq_puts(m, "ttyit\n");
+//  seq_printf(m, "cislo %d\n", 0);
+  return 0;
+}
+/** toto je len niaky debug interface
+static int ttyit_poll_init(struct tty_driver *driver, int line, char *options) {
+  pr_info("poll_init() line:%d\n", line);
+  return 0;
+}
+static int ttyit_poll_get_char(struct tty_driver *driver, int line) {
+  pr_info("poll_get_char() line:%d\n", line);
+  return 0;
+}
+static void ttyit_poll_put_char(struct tty_driver *driver, int line, char ch){
+  pr_info("poll_put_char() line:%d\n", line);
+}
+*/
+
+static void ttyit_poll(struct timer_list *unused) {
+  pr_info("timer poll()");
+  //neviem co ten lock robi 
+//FIXME moxa tu tiez pouziva spin_lock
+  spin_lock(&SpinLock);
+  //co naozaj robia realne drivre volaju flip, lenze tie vycitavaju na prerusenie alebo tak a ja musim vycitat/poll aktivne
+//		tty_insert_flip_char(&sclp_vt220_port, buffer[i], 0);
+// naplnit buffer, flipnut ho, tym sa odovzda do line-discipline na spracovanie
+// int tty_insert_flip_string_fixed_flag(struct tty_port *port, const unsigned char *chars, char flag, size_t size)¶
+// moxa ma na to niaky timer https://elixir.bootlin.com/linux/v6.1.59/source/drivers/tty/moxa.c#L719
+//
+//
+  if(_client) {
+    u8 inbuf[I2C_SMBUS_BLOCK_MAX];
+    int ret = 0;
+    //sposobuje to bug a zamrz BUG: scheduling while atomic:
+    //ret = i2c_smbus_read_block_data(_client, 0x80, (u8*)&inbuf);
+    pr_info("poll i2c received %x\n", ret);
+    if(ret > 0) {
+      u8 msg[MAX_MSG_SIZE];
+      int msg_size = unpack(inbuf, ret, (u8*)&msg);
+      if(msg_size != 0) {
+        //prijal som niake data
+        for(int j=0; j<msg_size; j++){
+          pr_info("%x ", msg[j]);
+          //vlozim hodnotu do buffru
+        }
+      }
+    } else {
+      pr_info("poll nothing received %d\n", ret);
+    }
+  } else {
+    pr_err("poll none i2c client object\n");
+  }
+
+
+//asi ked som nieco vycital tak mozem hned trigernut timer aby som mohol citat znova
+//if (served)
+//mal by som kontrolovat ci nebol ukonceny/exit() aby som ho znovu neaktivoval - nizka priorita problem max pri vypinani pocitaca
+  //pr_info("mod timer %d -> %d\n", get_jiffies_64(), get_jiffies_64() + HZ / TICK_PER_SEC);
+  //timer je jednorazovy takze ho musim znova nastavit
+  mod_timer(&ttyitTimer, get_jiffies_64() + HZ / TICK_PER_SEC);
+	
+  spin_unlock(&SpinLock);
 }
 
